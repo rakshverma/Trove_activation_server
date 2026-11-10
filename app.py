@@ -33,11 +33,25 @@ def _load_private_key() -> str:
     > ./trove_private_key.pem (local testing; git-ignored) > ../Trove_licensing (dev machine)."""
     if os.environ.get("TROVE_PRIVATE_KEY"):
         return os.environ["TROVE_PRIVATE_KEY"]
-    for p in (os.environ.get("TROVE_PRIVATE_KEY_PATH"), HERE / "trove_private_key.pem",
-              HERE.parent / "Trove_licensing" / "trove_private_key.pem"):
+    secrets_dir = Path("/etc/secrets")          # where Render mounts Secret Files
+    candidates = [os.environ.get("TROVE_PRIVATE_KEY_PATH"), secrets_dir / "trove_private_key.pem",
+                  HERE / "trove_private_key.pem", HERE.parent / "Trove_licensing" / "trove_private_key.pem"]
+    # A single .pem Secret File with a different name is fine too.
+    if secrets_dir.is_dir():
+        pems = sorted(secrets_dir.glob("*.pem"))
+        if len(pems) == 1:
+            candidates.append(pems[0])
+    for p in candidates:
         if p and Path(p).is_file():
-            return Path(p).read_text()
-    raise SystemExit("No private key: set TROVE_PRIVATE_KEY_PATH (Render Secret File) or TROVE_PRIVATE_KEY.")
+            text = Path(p).read_text()
+            if "PRIVATE KEY" not in text:
+                raise SystemExit(f"{p} doesn't contain a private key. Paste the whole trove_private_key.pem, "
+                                 "including the -----BEGIN/END PRIVATE KEY----- lines.")
+            return text
+    found = sorted(f.name for f in secrets_dir.iterdir()) if secrets_dir.is_dir() else "no /etc/secrets folder"
+    raise SystemExit("No private key found. On Render: Environment -> Secret Files -> add a file named "
+                     f"trove_private_key.pem with the key's contents, then redeploy. (Secret files present: {found}; "
+                     f"TROVE_PRIVATE_KEY_PATH={os.environ.get('TROVE_PRIVATE_KEY_PATH') or 'not set'})")
 
 
 _pem = _load_private_key()
