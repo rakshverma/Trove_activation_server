@@ -1,0 +1,8 @@
+# Secrets and data — never commit these
+*.pem
+*.db
+*.db-journal
+keys.txt
+keys_index.csv
+__pycache__/
+.venv/

@@ -1,0 +1,19 @@
+# Render Blueprint: New -> Blueprint -> pick this repo. Creates the web service + a persistent disk.
+# After the first deploy, add the Secret File "trove_private_key.pem" in the dashboard (see README.md).
+services:
+  - type: web
+    name: trove-activation
+    runtime: docker
+    plan: starter            # paid plan: needed for the persistent disk and to avoid sleeping
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TROVE_DB
+        value: /data/activations.db
+      - key: TROVE_PRIVATE_KEY_PATH
+        value: /etc/secrets/trove_private_key.pem
+    disk:
+      name: trove-data
+      mountPath: /data       # activations.db lives here and survives restarts / redeploys
+      sizeGB: 1
