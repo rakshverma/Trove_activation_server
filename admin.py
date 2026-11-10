@@ -1,4 +1,4 @@
-"""Admin tool for the activation database.
+"""Admin tool for activations (works with Neon/Postgres via DATABASE_URL, or local SQLite).
 
   python admin.py stats
   python admin.py list [--limit 50]
@@ -10,44 +10,58 @@
 """
 import datetime as dt
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
-DB = os.environ.get("TROVE_DB", str(Path(__file__).resolve().parent / "activations.db"))
-db = sqlite3.connect(DB)
-cmd, args = (sys.argv[1] if len(sys.argv) > 1 else "stats"), sys.argv[2:]
+import db
 
-if cmd == "stats":
-    total, revoked = db.execute("SELECT COUNT(*), COALESCE(SUM(revoked),0) FROM activations").fetchone()
-    print(f"activated keys: {total}  revoked: {revoked}")
-    for outcome, n in db.execute("SELECT outcome, COUNT(*) FROM events GROUP BY outcome"):
-        print(f"  {outcome:14} {n}")
-elif cmd == "list":
-    limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 50
-    for r in db.execute("SELECT key_id, device_name, activated_at, expires_at, revoked FROM activations "
-                        "ORDER BY activated_at DESC LIMIT ?", (limit,)):
-        print(" | ".join(str(x) for x in r))
-elif cmd == "show":
-    r = db.execute("SELECT * FROM activations WHERE key_id=?", (args[0],)).fetchone()
-    print(r or "not activated yet")
-    for e in db.execute("SELECT * FROM events WHERE key_id=? ORDER BY at", (args[0],)):
-        print("  ", e)
-elif cmd == "reset":
-    # Free the machine binding but keep the original expiry; the next activation re-binds it.
-    r = db.execute("SELECT activated_at, expires_at FROM activations WHERE key_id=?", (args[0],)).fetchone()
-    if not r:
-        print("not activated yet")
+db.init(os.environ.get("TROVE_DB", str(Path(__file__).resolve().parent / "activations.db")))
+cmd, args = (sys.argv[1] if len(sys.argv) > 1 else "help"), sys.argv[2:]
+
+
+def need_key():
+    if not args:
+        sys.exit("Give a key id, e.g. TRV-6D5B068C791A")
+    return args[0].strip().upper()
+
+
+with db.tx() as c:
+    if cmd == "stats":
+        total, revoked = c.execute("SELECT COUNT(*), COALESCE(SUM(revoked), 0) FROM activations").fetchone()
+        print(f"activated keys: {total}  revoked: {revoked}")
+        for outcome, n in c.execute("SELECT outcome, COUNT(*) FROM events GROUP BY outcome ORDER BY outcome").fetchall():
+            print(f"  {outcome:14} {n}")
+    elif cmd == "list":
+        limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 50
+        for r in c.execute("SELECT key_id, device_name, activated_at, expires_at, revoked FROM activations "
+                           "ORDER BY activated_at DESC LIMIT ?", (limit,)).fetchall():
+            print(" | ".join(str(x) for x in r))
+    elif cmd == "show":
+        kid = need_key()
+        r = c.execute("SELECT * FROM activations WHERE key_id=?", (kid,)).fetchone()
+        print(r or "not activated yet")
+        for e in c.execute("SELECT * FROM events WHERE key_id=? ORDER BY at", (kid,)).fetchall():
+            print("  ", e)
+    elif cmd == "reset":
+        kid = need_key()
+        r = c.execute("SELECT expires_at FROM activations WHERE key_id=?", (kid,)).fetchone()
+        if not r:
+            print("not activated yet")
+        else:
+            # Free the machine binding but keep the original expiry; the next activation re-binds it.
+            c.execute("UPDATE activations SET machine_id='__unbound__' WHERE key_id=?", (kid,))
+            print(f"{kid} can now be activated on a new computer (expires {r[0]})")
+    elif cmd in ("revoke", "unrevoke"):
+        kid = need_key()
+        c.execute("UPDATE activations SET revoked=? WHERE key_id=?", (1 if cmd == "revoke" else 0, kid))
+        print(f"{cmd}d {kid}" if c.rowcount else f"{kid} isn't activated yet")
+    elif cmd == "extend":
+        kid = need_key()
+        r = c.execute("SELECT expires_at FROM activations WHERE key_id=?", (kid,)).fetchone()
+        if not r:
+            sys.exit(f"{kid} isn't activated yet")
+        new = dt.datetime.fromisoformat(r[0]) + dt.timedelta(days=int(args[1]))
+        c.execute("UPDATE activations SET expires_at=? WHERE key_id=?", (new.isoformat(), kid))
+        print(f"{kid} now expires {new.isoformat()}")
     else:
-        db.execute("UPDATE activations SET machine_id='__unbound__' WHERE key_id=?", (args[0],))
-        db.commit(); print(f"{args[0]} can now be activated on a new computer (expires {r[1]})")
-elif cmd in ("revoke", "unrevoke"):
-    db.execute("UPDATE activations SET revoked=? WHERE key_id=?", (1 if cmd == "revoke" else 0, args[0]))
-    db.commit(); print(f"{cmd}d {args[0]}")
-elif cmd == "extend":
-    r = db.execute("SELECT expires_at FROM activations WHERE key_id=?", (args[0],)).fetchone()
-    new = dt.datetime.fromisoformat(r[0]) + dt.timedelta(days=int(args[1]))
-    db.execute("UPDATE activations SET expires_at=? WHERE key_id=?", (new.isoformat(), args[0]))
-    db.commit(); print(f"{args[0]} now expires {new.isoformat()}")
-else:
-    print(__doc__)
+        print(__doc__)

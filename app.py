@@ -10,14 +10,14 @@ The certificate is an RS256 token (same Trove key pair) containing the key id, t
 hashed machine id and the expiry. The app verifies it offline on every start.
 
 Config (env vars):
-  TROVE_PRIVATE_KEY_PATH   path to trove_private_key.pem   (or TROVE_PRIVATE_KEY = PEM text)
-  TROVE_DB                 SQLite file (default ./activations.db)
-Run:  uvicorn app:app --host 0.0.0.0 --port 8090
+  DATABASE_URL             Postgres connection string (e.g. Neon). If unset, SQLite at TROVE_DB.
+  TROVE_DB                 SQLite file for local use (default ./activations.db)
+  TROVE_PRIVATE_KEY_PATH   path to trove_private_key.pem   (or TROVE_PRIVATE_KEY = PEM text;
+                           on Render a Secret File under /etc/secrets is found automatically)
+Run:  uvicorn app:app --host 0.0.0.0 --port 10000
 """
 import datetime as dt
 import os
-import sqlite3
-import threading
 from pathlib import Path
 
 import jwt
@@ -25,50 +25,49 @@ from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+import db
+
 HERE = Path(__file__).resolve().parent
 
 
 def _load_private_key() -> str:
-    """TROVE_PRIVATE_KEY (PEM text) > TROVE_PRIVATE_KEY_PATH (e.g. a Render Secret File)
-    > ./trove_private_key.pem (local testing; git-ignored) > ../Trove_licensing (dev machine)."""
-    if os.environ.get("TROVE_PRIVATE_KEY"):
-        return os.environ["TROVE_PRIVATE_KEY"]
-    secrets_dir = Path("/etc/secrets")          # where Render mounts Secret Files
-    candidates = [os.environ.get("TROVE_PRIVATE_KEY_PATH"), secrets_dir / "trove_private_key.pem",
-                  HERE / "trove_private_key.pem", HERE.parent / "Trove_licensing" / "trove_private_key.pem"]
-    # A single .pem Secret File with a different name is fine too.
+    """TROVE_PRIVATE_KEY (PEM text) > TROVE_PRIVATE_KEY_PATH > any file under /etc/secrets (Render
+    Secret Files, whatever its name) containing a private key > local files (testing / dev machine)."""
+    if os.environ.get("TROVE_PRIVATE_KEY", "").strip():
+        return os.environ["TROVE_PRIVATE_KEY"].replace("\\n", "\n")
+    secrets_dir = Path(os.environ.get("TROVE_SECRETS_DIR", "/etc/secrets"))   # Render mounts Secret Files here
+    candidates = [os.environ.get("TROVE_PRIVATE_KEY_PATH"), secrets_dir / "trove_private_key.pem"]
     if secrets_dir.is_dir():
-        pems = sorted(secrets_dir.glob("*.pem"))
-        if len(pems) == 1:
-            candidates.append(pems[0])
+        # Render keeps the real files in ..data/ with symlinks on top — look everywhere, any name.
+        for f in sorted(secrets_dir.rglob("*")):
+            try:
+                if f.is_file() and f.stat().st_size < 20000:
+                    candidates.append(f)
+            except OSError:
+                continue
+    candidates += [HERE / "trove_private_key.pem", HERE.parent / "Trove_licensing" / "trove_private_key.pem"]
+    wrong = []
     for p in candidates:
-        if p and Path(p).is_file():
-            text = Path(p).read_text()
-            if "PRIVATE KEY" not in text:
-                raise SystemExit(f"{p} doesn't contain a private key. Paste the whole trove_private_key.pem, "
-                                 "including the -----BEGIN/END PRIVATE KEY----- lines.")
+        if not p or not Path(p).is_file():
+            continue
+        text = Path(p).read_text(errors="ignore")
+        if "PRIVATE KEY-----" in text:
+            print(f"[trove] using private key from {p}", flush=True)
             return text
-    found = sorted(f.name for f in secrets_dir.iterdir()) if secrets_dir.is_dir() else "no /etc/secrets folder"
-    raise SystemExit("No private key found. On Render: Environment -> Secret Files -> add a file named "
-                     f"trove_private_key.pem with the key's contents, then redeploy. (Secret files present: {found}; "
-                     f"TROVE_PRIVATE_KEY_PATH={os.environ.get('TROVE_PRIVATE_KEY_PATH') or 'not set'})")
+        wrong.append(str(p))
+    present = sorted(str(f.relative_to(secrets_dir)) for f in secrets_dir.rglob("*")) if secrets_dir.is_dir() else []
+    raise SystemExit(
+        "No private key found. On Render open THIS service -> Environment -> Secret Files -> Add Secret File: "
+        "filename trove_private_key.pem, contents = the whole key incl. the BEGIN/END PRIVATE KEY lines -> Save, "
+        f"then Manual Deploy. (Files under {secrets_dir}: {present or 'none'}"
+        + (f"; files without a key: {wrong}" if wrong else "") + ")")
 
 
 _pem = _load_private_key()
 PRIVATE_KEY = _pem.encode()
 PUBLIC_KEY = serialization.load_pem_private_key(PRIVATE_KEY, password=None).public_key().public_bytes(
     serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-DB_PATH = os.environ.get("TROVE_DB", str(HERE / "activations.db"))
-
-_lock = threading.Lock()
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.execute("""CREATE TABLE IF NOT EXISTS activations (
-    key_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, device_name TEXT, app_version TEXT,
-    activated_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
-    last_seen TEXT, activations INTEGER NOT NULL DEFAULT 1)""")
-_db.execute("""CREATE TABLE IF NOT EXISTS events (
-    at TEXT, key_id TEXT, machine_id TEXT, ip TEXT, outcome TEXT)""")
-_db.commit()
+print(f"[trove] storage: {db.init(os.environ.get('TROVE_DB', str(HERE / 'activations.db')))}", flush=True)
 
 app = FastAPI(title="Trove activation")
 
@@ -88,8 +87,9 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 
-def _log(key_id, machine_id, ip, outcome):
-    _db.execute("INSERT INTO events VALUES (?,?,?,?,?)", (_now().isoformat(), key_id, machine_id, ip, outcome))
+def _log(c, key_id, machine_id, ip, outcome):
+    c.execute("INSERT INTO events (at, key_id, machine_id, ip, outcome) VALUES (?,?,?,?,?)",
+              (_now().isoformat(), key_id, machine_id, ip, outcome))
 
 
 def _certificate(key_id, machine_id, activated_at: dt.datetime, expires_at: dt.datetime) -> str:
@@ -103,6 +103,11 @@ def health():
     return {"ok": True}
 
 
+class _Refuse(Exception):
+    def __init__(self, status, detail, outcome):
+        self.status, self.detail, self.outcome = status, detail, outcome
+
+
 @app.post("/v1/activate")
 def activate(body: ActivateIn, request: Request):
     ip = request.client.host if request.client else "?"
@@ -111,41 +116,45 @@ def activate(body: ActivateIn, request: Request):
         if lic.get("iss") != "trove" or lic.get("typ") != "license":
             raise jwt.InvalidTokenError("not a Trove license")
     except jwt.InvalidTokenError:
-        with _lock:
-            _log(None, body.machine_id, ip, "invalid_key"); _db.commit()
+        with db.tx() as c:
+            _log(c, None, body.machine_id, ip, "invalid_key")
         raise HTTPException(400, "This license key isn't valid. Check that you copied the whole key.")
     key_id, days = lic["kid"], int(lic.get("days", 365))
-    with _lock:
-        row = _db.execute("SELECT machine_id, activated_at, expires_at, revoked FROM activations WHERE key_id=?",
-                          (key_id,)).fetchone()
-        now = _now()
-        if row is None:
-            activated, expires = now, now + dt.timedelta(days=days)
-            _db.execute("INSERT INTO activations (key_id, machine_id, device_name, app_version, activated_at, expires_at, last_seen) "
-                        "VALUES (?,?,?,?,?,?,?)", (key_id, body.machine_id, body.device_name, body.app_version,
-                                                   activated.isoformat(), expires.isoformat(), now.isoformat()))
-            outcome = "activated"
-        else:
-            bound, act_s, exp_s, revoked = row
-            if revoked:
-                _log(key_id, body.machine_id, ip, "revoked"); _db.commit()
-                raise HTTPException(403, "This license key has been revoked. Please contact support.")
-            if bound == "__unbound__":
-                # Support reset the key (admin.py reset): bind it to this computer, keep the original expiry.
-                _db.execute("UPDATE activations SET machine_id=?, device_name=? WHERE key_id=?",
-                            (body.machine_id, body.device_name, key_id))
-                bound = body.machine_id
-            if bound != body.machine_id:
-                _log(key_id, body.machine_id, ip, "other_device"); _db.commit()
-                raise HTTPException(409, "This key is already activated on another computer. "
-                                         "Contact support to move it to this one.")
-            # Same computer (e.g. reinstall): same expiry — the year doesn't restart.
-            activated, expires = dt.datetime.fromisoformat(act_s), dt.datetime.fromisoformat(exp_s)
-            _db.execute("UPDATE activations SET last_seen=?, activations=activations+1, app_version=? WHERE key_id=?",
-                        (now.isoformat(), body.app_version, key_id))
-            outcome = "reactivated"
-        _log(key_id, body.machine_id, ip, outcome)
-        _db.commit()
+    now = _now()
+    try:
+        with db.tx() as c:
+            # First activation wins, even if two requests race: only one INSERT succeeds.
+            fresh_exp = now + dt.timedelta(days=days)
+            c.execute("INSERT INTO activations (key_id, machine_id, device_name, app_version, activated_at, "
+                      "expires_at, last_seen) VALUES (?,?,?,?,?,?,?) ON CONFLICT (key_id) DO NOTHING",
+                      (key_id, body.machine_id, body.device_name, body.app_version,
+                       now.isoformat(), fresh_exp.isoformat(), now.isoformat()))
+            if c.rowcount == 1:
+                activated, expires, outcome = now, fresh_exp, "activated"
+            else:
+                bound, act_s, exp_s, revoked = c.execute(
+                    "SELECT machine_id, activated_at, expires_at, revoked FROM activations WHERE key_id=?"
+                    + (" FOR UPDATE" if db.IS_PG else ""), (key_id,)).fetchone()
+                if revoked:
+                    raise _Refuse(403, "This license key has been revoked. Please contact support.", "revoked")
+                if bound == "__unbound__":
+                    # Support reset the key (admin.py reset): bind it to this computer, keep the original expiry.
+                    c.execute("UPDATE activations SET machine_id=?, device_name=? WHERE key_id=?",
+                              (body.machine_id, body.device_name, key_id))
+                    bound = body.machine_id
+                if bound != body.machine_id:
+                    raise _Refuse(409, "This key is already activated on another computer. "
+                                       "Contact support to move it to this one.", "other_device")
+                # Same computer (e.g. reinstall): same expiry — the year doesn't restart.
+                activated, expires = dt.datetime.fromisoformat(act_s), dt.datetime.fromisoformat(exp_s)
+                c.execute("UPDATE activations SET last_seen=?, activations=activations+1, app_version=? "
+                          "WHERE key_id=?", (now.isoformat(), body.app_version, key_id))
+                outcome = "reactivated"
+            _log(c, key_id, body.machine_id, ip, outcome)
+    except _Refuse as r:
+        with db.tx() as c:
+            _log(c, key_id, body.machine_id, ip, r.outcome)
+        raise HTTPException(r.status, r.detail)
     if expires <= now:
         raise HTTPException(403, f"This license expired on {expires.date()}. Please renew.")
     return {"certificate": _certificate(key_id, body.machine_id, activated, expires), "key_id": key_id,
@@ -160,10 +169,9 @@ def validate(body: ValidateIn):
         raise HTTPException(403, "License expired.")
     except jwt.InvalidTokenError:
         raise HTTPException(400, "Invalid certificate.")
-    with _lock:
-        row = _db.execute("SELECT revoked, machine_id FROM activations WHERE key_id=?", (cert["kid"],)).fetchone()
+    with db.tx() as c:
+        row = c.execute("SELECT revoked, machine_id FROM activations WHERE key_id=?", (cert["kid"],)).fetchone()
         if not row or row[0] or row[1] != cert["mid"]:
             raise HTTPException(403, "This activation is no longer valid.")
-        _db.execute("UPDATE activations SET last_seen=? WHERE key_id=?", (_now().isoformat(), cert["kid"]))
-        _db.commit()
+        c.execute("UPDATE activations SET last_seen=? WHERE key_id=?", (_now().isoformat(), cert["kid"]))
     return {"ok": True, "expires_at": dt.datetime.fromtimestamp(cert["exp"], dt.timezone.utc).isoformat()}
